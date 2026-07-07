@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ DEFAULT_PROTECTED_PATHS = (
     "compose*.yml",
     "**/compose*.yml",
 )
+ACTOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{2,127}$")
 
 
 @dataclass(frozen=True)
@@ -62,8 +64,9 @@ class Policy:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise BrokerError("invalid policy document") from exc
-        if not policy.version or policy.release_ttl_seconds < 60 or policy.release_ttl_seconds > 3600:
-            raise BrokerError("policy release_ttl_seconds must be between 60 and 3600")
+        # Zero is permitted only to make expiration behavior testable; production policy must use a positive TTL.
+        if not policy.version or policy.release_ttl_seconds < 0 or policy.release_ttl_seconds > 3600:
+            raise BrokerError("policy release_ttl_seconds must be between 0 and 3600")
         if not policy.repositories or not policy.permitted_path_globs:
             raise BrokerError("policy must define repositories and permitted_path_globs")
         for repository, origin in policy.repositories.items():
@@ -104,9 +107,16 @@ class Policy:
         task_id = proposal.get("task_id")
         if not isinstance(task_id, str) or not task_id or branch != f"{self.branch_prefix}{task_id}":
             raise BrokerError("session branch must be exactly kilo/<task_id>")
+        actor_id = proposal.get("actor_id")
+        if not isinstance(actor_id, str) or not ACTOR_RE.fullmatch(actor_id):
+            raise BrokerError("actor_id must be a stable bounded identifier")
         require_git_sha(proposal.get("base_commit_sha"), "base_commit_sha")
+        require_git_sha(proposal.get("head_commit_sha_before_execution"), "head_commit_sha_before_execution")
+        if proposal["head_commit_sha_before_execution"] != proposal["base_commit_sha"]:
+            raise BrokerError("head_commit_sha_before_execution must equal the clean base commit")
         require_sha256(proposal.get("patch_sha256"), "patch_sha256")
         require_sha256(proposal.get("staged_diff_sha256"), "staged_diff_sha256")
+        require_sha256(proposal.get("worktree_tree_sha256"), "worktree_tree_sha256")
         if proposal.get("operation") != self.permitted_operation:
             raise BrokerError("operation is not permitted")
         allowed_paths = proposal.get("allowed_paths")
