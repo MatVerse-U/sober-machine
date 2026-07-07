@@ -1,0 +1,31 @@
+{
+  "name": "MATVERSE_PR_OPERATOR",
+  "control_mode": "MCP_ONLY",
+  "mcp_command": ["node", "scripts/mcp_stdio_server.mjs"],
+  "allowed_tools": [
+    "cassandra_propose",
+    "cassandra_record_decision",
+    "cassandra_release",
+    "omega_execute",
+    "verify_receipts"
+  ],
+  "denied_tools": [
+    "bash",
+    "shell",
+    "terminal",
+    "git",
+    "gh",
+    "edit",
+    "delete",
+    "webfetch",
+    "websearch",
+    "docker",
+    "deploy"
+  ],
+  "environment": {
+    "PATH": "/opt/matverse-mcp/bin",
+    "MATVERSE_CONTROL_MODE": "MCP_ONLY",
+    "MATVERSE_BROKER_SOCKET": "/run/omega-broker/broker.sock"
+  },
+  "status": "HOLD"
+}
