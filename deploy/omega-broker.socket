@@ -1,0 +1,13 @@
+[Unit]
+Description=MatVerse Omega broker socket
+
+[Socket]
+ListenStream=/run/omega-broker/broker.sock
+SocketUser=omega
+SocketGroup=kilo-mcp
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target
