@@ -7,6 +7,7 @@ from typing import Any
 
 from .core import BrokerError, b64url_decode, canonical_json, iso_utc, require_sha256, sha256_hex, utc_now
 from .crypto import Ed25519Signer, Ed25519Verifier
+from .nonce_registry import NonceRegistry
 from .policy import Policy
 from .store import EventStore
 
@@ -21,11 +22,13 @@ class BrokerService:
         policy: Policy,
         cassandra_signer: Ed25519Signer,
         human_verifiers: dict[str, Ed25519Verifier],
+        nonce_registry: NonceRegistry,
     ) -> None:
         self.store = store
         self.policy = policy
         self.cassandra_signer = cassandra_signer
         self.human_verifiers = human_verifiers
+        self.nonce_registry = nonce_registry
 
     def cassandra_propose(self, proposal: dict[str, Any]) -> dict[str, Any]:
         self.policy.validate_proposal(proposal)
@@ -84,6 +87,9 @@ class BrokerService:
             "base_branch": proposal["base_branch"],
             "session_branch": proposal["session_branch"],
             "base_commit_sha": proposal["base_commit_sha"],
+            "head_commit_sha_before_execution": proposal["head_commit_sha_before_execution"],
+            "worktree_tree_sha256": proposal["worktree_tree_sha256"],
+            "actor_id": proposal["actor_id"],
             "operation": proposal["operation"],
             "allowed_paths": proposal["allowed_paths"],
             "artifact_hashes": proposal["artifact_hashes"],
@@ -96,15 +102,21 @@ class BrokerService:
         }
         self.policy.validate_release(release_body)
         scope_digest = sha256_hex(canonical_json(release_body))
-        signature = self.cassandra_signer.sign_json(release_body)
-        return self.store.issue_release(release_body, scope_digest, signature)
+        signed_body = {**release_body, "scope_digest": scope_digest}
+        signature = self.cassandra_signer.sign_json(signed_body)
+        issued = self.store.issue_release(signed_body, scope_digest, signature)
+        # A crash after issuance but before register is fail-closed: Ω cannot reserve an unregistered nonce.
+        self.nonce_registry.register(
+            nonce=signed_body["nonce"],
+            release_id=signed_body["release_id"],
+            expires_at=signed_body["expires_at"],
+        )
+        return issued
 
     def _latest_receipt_hash(self, task_id: str) -> str:
-        # Decision must have created a receipt. The chain verifier detects any storage tampering later.
         errors = self.store.verify_task_chain(task_id, Ed25519Verifier.from_pem_bytes(self.cassandra_signer.public_pem()))
         if errors:
             raise BrokerError("receipt chain failed verification before release: " + "; ".join(errors))
-        # The store intentionally exposes no mutable receipt references. Query through its trusted database file.
         import sqlite3
 
         conn = sqlite3.connect(self.store.database_path)
