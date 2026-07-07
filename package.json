@@ -1,0 +1,14 @@
+{
+  "name": "@matverse/sober-machine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "mcp": "node tools/matverse-sober-mcp.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "check": "npm run test"
+  }
+}
