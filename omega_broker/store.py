@@ -7,12 +7,17 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .core import BrokerError, canonical_json, iso_utc, parse_utc, sha256_hex, utc_now
+from .core import BrokerError, canonical_json, iso_utc, sha256_hex
 from .crypto import Ed25519Signer, Ed25519Verifier
 
 
 class EventStore:
-    """Trusted SQLite state. It must live outside the Kilo worktree with mode 0700."""
+    """Broker-owned receipts and immutable release records.
+
+    Release liveness is intentionally not stored here. `NonceRegistry`, protected
+    by `flock`, is the only authority for UNUSED -> RESERVED -> EXECUTING ->
+    EXECUTED | UNKNOWN transitions.
+    """
 
     def __init__(self, database_path: str | Path, receipt_signer: Ed25519Signer) -> None:
         self.database_path = Path(database_path)
@@ -51,10 +56,8 @@ class EventStore:
                     scope_digest TEXT NOT NULL,
                     signature TEXT NOT NULL,
                     nonce TEXT NOT NULL UNIQUE,
-                    status TEXT NOT NULL CHECK(status IN ('ISSUED','RESERVED','EXECUTED','FAILED','UNKNOWN','BLOCKED')),
                     issued_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
-                    reserved_at TEXT,
                     execution_json TEXT
                 );
                 CREATE TABLE IF NOT EXISTS receipts (
@@ -129,15 +132,14 @@ class EventStore:
         task_id = proposal["task_id"]
         with self._transaction() as conn:
             existing = conn.execute("SELECT proposal_hash FROM proposals WHERE task_id=?", (task_id,)).fetchone()
-            if existing is not None:
-                if existing["proposal_hash"] != proposal_hash:
-                    raise BrokerError("task_id already belongs to a different immutable proposal")
-                return self.get_proposal(task_id)
-            conn.execute(
-                "INSERT INTO proposals(task_id,proposal_json,proposal_hash,created_at) VALUES(?,?,?,?)",
-                (task_id, json.dumps(proposal, separators=(",", ":")), proposal_hash, iso_utc()),
-            )
-            self._append_receipt_tx(conn, task_id=task_id, event="PROPOSED", data={"proposal_hash": proposal_hash})
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO proposals(task_id,proposal_json,proposal_hash,created_at) VALUES(?,?,?,?)",
+                    (task_id, json.dumps(proposal, separators=(",", ":")), proposal_hash, iso_utc()),
+                )
+                self._append_receipt_tx(conn, task_id=task_id, event="PROPOSED", data={"proposal_hash": proposal_hash})
+            elif existing["proposal_hash"] != proposal_hash:
+                raise BrokerError("task_id already belongs to a different immutable proposal")
         return self.get_proposal(task_id)
 
     def get_proposal(self, task_id: str) -> dict[str, Any]:
@@ -145,8 +147,7 @@ class EventStore:
             row = conn.execute("SELECT proposal_json,proposal_hash,created_at FROM proposals WHERE task_id=?", (task_id,)).fetchone()
         if row is None:
             raise BrokerError("proposal not found")
-        proposal = self._loads(str(row["proposal_json"]))
-        return {"proposal": proposal, "proposal_hash": row["proposal_hash"], "created_at": row["created_at"]}
+        return {"proposal": self._loads(str(row["proposal_json"])), "proposal_hash": row["proposal_hash"], "created_at": row["created_at"]}
 
     def record_decision(self, task_id: str, decision: dict[str, Any], status: str) -> dict[str, Any]:
         with self._transaction() as conn:
@@ -168,20 +169,19 @@ class EventStore:
         return {"decision": self._loads(str(row["decision_json"])), "status": row["status"], "created_at": row["created_at"]}
 
     def issue_release(self, release_body: dict[str, Any], scope_digest: str, signature: str) -> dict[str, Any]:
-        release_id = release_body["release_id"]
         with self._transaction() as conn:
             conn.execute(
-                "INSERT INTO releases(release_id,task_id,release_json,scope_digest,signature,nonce,status,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (release_id, release_body["task_id"], json.dumps(release_body, separators=(",", ":")), scope_digest, signature, release_body["nonce"], "ISSUED", release_body["issued_at"], release_body["expires_at"]),
+                "INSERT INTO releases(release_id,task_id,release_json,scope_digest,signature,nonce,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?)",
+                (release_body["release_id"], release_body["task_id"], json.dumps(release_body, separators=(",", ":")), scope_digest, signature, release_body["nonce"], release_body["issued_at"], release_body["expires_at"]),
             )
             self._append_receipt_tx(
                 conn,
                 task_id=release_body["task_id"],
-                release_id=release_id,
+                release_id=release_body["release_id"],
                 event="CASSANDRA_RELEASED",
                 data={"scope_digest": scope_digest, "expires_at": release_body["expires_at"]},
             )
-        return self.get_release(release_id)
+        return self.get_release(release_body["release_id"])
 
     def get_release(self, release_id: str) -> dict[str, Any]:
         with self._connect() as conn:
@@ -192,48 +192,26 @@ class EventStore:
             "body": self._loads(str(row["release_json"])),
             "scope_digest": row["scope_digest"],
             "signature": row["signature"],
-            "status": row["status"],
             "execution": None if row["execution_json"] is None else self._loads(str(row["execution_json"])),
         }
 
-    def reserve_release(self, release_id: str) -> dict[str, Any]:
-        """Atomically claim a release before any external effect starts."""
+    def append_omega_receipt(self, release_id: str, event: str, data: dict[str, Any]) -> dict[str, Any]:
+        if event not in {"OMEGA_RESERVED", "OMEGA_EXECUTING", "OMEGA_EXECUTED", "OMEGA_UNKNOWN", "OMEGA_BLOCKED"}:
+            raise BrokerError("invalid omega receipt event")
         with self._transaction() as conn:
-            row = conn.execute("SELECT * FROM releases WHERE release_id=?", (release_id,)).fetchone()
+            row = conn.execute("SELECT task_id FROM releases WHERE release_id=?", (release_id,)).fetchone()
             if row is None:
                 raise BrokerError("release not found")
-            if row["status"] != "ISSUED":
-                raise BrokerError(f"release cannot be executed from state {row['status']}")
-            if parse_utc(str(row["expires_at"])) <= utc_now():
-                conn.execute("UPDATE releases SET status='BLOCKED' WHERE release_id=? AND status='ISSUED'", (release_id,))
-                self._append_receipt_tx(conn, task_id=row["task_id"], release_id=release_id, event="OMEGA_BLOCKED", data={"reason": "release_expired"})
-                raise BrokerError("release expired")
-            updated = conn.execute(
-                "UPDATE releases SET status='RESERVED',reserved_at=? WHERE release_id=? AND status='ISSUED'",
-                (iso_utc(), release_id),
-            )
-            if updated.rowcount != 1:
-                raise BrokerError("release reservation race lost")
-            self._append_receipt_tx(conn, task_id=row["task_id"], release_id=release_id, event="OMEGA_RESERVED", data={"nonce": row["nonce"]})
-        return self.get_release(release_id)
+            if event in {"OMEGA_EXECUTED", "OMEGA_UNKNOWN", "OMEGA_BLOCKED"}:
+                conn.execute("UPDATE releases SET execution_json=? WHERE release_id=?", (json.dumps(data, separators=(",", ":")), release_id))
+            return self._append_receipt_tx(conn, task_id=row["task_id"], release_id=release_id, event=event, data=data)
 
-    def complete_release(self, release_id: str, outcome: str, data: dict[str, Any]) -> dict[str, Any]:
-        if outcome not in {"OMEGA_EXECUTED", "OMEGA_FAILED", "OMEGA_UNKNOWN", "OMEGA_BLOCKED"}:
-            raise BrokerError("invalid omega outcome")
-        target_state = {
-            "OMEGA_EXECUTED": "EXECUTED",
-            "OMEGA_FAILED": "FAILED",
-            "OMEGA_UNKNOWN": "UNKNOWN",
-            "OMEGA_BLOCKED": "BLOCKED",
-        }[outcome]
-        with self._transaction() as conn:
-            row = conn.execute("SELECT task_id,status FROM releases WHERE release_id=?", (release_id,)).fetchone()
-            if row is None:
-                raise BrokerError("release not found")
-            if row["status"] != "RESERVED":
-                raise BrokerError("only an atomically reserved release can be completed")
-            conn.execute("UPDATE releases SET status=?,execution_json=? WHERE release_id=?", (target_state, json.dumps(data, separators=(",", ":")), release_id))
-            return self._append_receipt_tx(conn, task_id=row["task_id"], release_id=release_id, event=outcome, data=data)
+    def latest_receipt_hash(self, task_id: str) -> str:
+        with self._connect() as conn:
+            row = conn.execute("SELECT digest FROM receipts WHERE task_id=? ORDER BY sequence DESC LIMIT 1", (task_id,)).fetchone()
+        if row is None:
+            raise BrokerError("receipt is missing")
+        return str(row["digest"])
 
     def verify_task_chain(self, task_id: str, verifier: Ed25519Verifier) -> list[str]:
         errors: list[str] = []
