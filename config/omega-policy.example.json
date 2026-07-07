@@ -1,0 +1,31 @@
+{
+  "version": "omega-policy-v1",
+  "repositories": {
+    "MatVerse-U/sober-machine": "https://github.com/MatVerse-U/sober-machine.git"
+  },
+  "permitted_path_globs": [
+    "docs/**",
+    "omega_broker/**",
+    "tests/**"
+  ],
+  "protected_path_globs": [
+    ".git/**",
+    ".github/**",
+    ".gitlab/**",
+    "**/.env",
+    "**/.env.*",
+    "**/*secret*",
+    "**/*credential*",
+    "**/*.pem",
+    "**/*.key",
+    "**/id_rsa",
+    "**/authorized_keys",
+    "Dockerfile",
+    "**/Dockerfile",
+    "compose*.yml",
+    "**/compose*.yml"
+  ],
+  "release_ttl_seconds": 600,
+  "branch_prefix": "kilo/",
+  "permitted_operation": "git.open_draft_pr"
+}
