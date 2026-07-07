@@ -4,7 +4,7 @@ from typing import Any
 
 from .core import BrokerError
 from .crypto import Ed25519Verifier
-from .nonce_registry import NonceRegistry
+from .nonce_registry import NonceRegistry, NonceStateError
 from .policy import Policy
 from .snapshot import verify_snapshot
 from .store import EventStore
@@ -34,7 +34,12 @@ class OmegaLifecycle:
         release = self.store.get_release(release_id)
         body = release["body"]
         self._validate_static(release)
-        state = self.nonce_registry.reserve(body["nonce"], release_id)
+        try:
+            state = self.nonce_registry.reserve(body["nonce"], release_id)
+        except NonceStateError as exc:
+            if exc.code == "release_expired":
+                self.store.append_omega_receipt(release_id, "OMEGA_BLOCKED", {"reason": "release_expired"})
+            raise
         receipt = self.store.append_omega_receipt(release_id, "OMEGA_RESERVED", {"nonce_state": state["state"]})
         return {"release": release, "nonce": state, "receipt": receipt}
 
@@ -42,7 +47,11 @@ class OmegaLifecycle:
         release = self.store.get_release(release_id)
         body = release["body"]
         self._validate_static(release)
-        verify_snapshot(body, observed_snapshot)
+        try:
+            verify_snapshot(body, observed_snapshot)
+        except BrokerError as exc:
+            self.store.append_omega_receipt(release_id, "OMEGA_BLOCKED", {"reason": str(exc)})
+            raise
         state = self.nonce_registry.start_execution(body["nonce"], release_id)
         receipt = self.store.append_omega_receipt(release_id, "OMEGA_EXECUTING", {"nonce_state": state["state"]})
         return {"release": release, "nonce": state, "receipt": receipt}
