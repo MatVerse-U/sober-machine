@@ -1,0 +1,11 @@
+{
+  "name": "matverse-omega-broker",
+  "private": true,
+  "version": "0.3.0-hold",
+  "type": "module",
+  "scripts": {
+    "typecheck": "python3 -m compileall -q omega_broker scripts && node --check scripts/mcp_stdio_server.mjs",
+    "lint": "python3 -m unittest discover -s tests -p 'test_*.py' && node --test tests/test_mcp_stdio.mjs",
+    "build": "python3 -m compileall -q omega_broker scripts"
+  }
+}
